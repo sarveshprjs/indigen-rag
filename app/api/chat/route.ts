@@ -1,85 +1,69 @@
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-import { anthropic } from "@ai-sdk/anthropic";
-import { streamText, tool } from "ai";
-import { z } from "zod";
-import { hybridSearch, formatChunksForPrompt } from "@/lib/retrieval";
-import { llmBreaker } from "@/lib/circuit-breaker";
 
-const SYSTEM_PROMPT = `You are an intelligent document analyst with access to a curated document corpus.
+import { NextRequest, NextResponse } from "next/server";
+import { supabaseAdmin } from "@/lib/supabase";
+import { chunkText } from "@/lib/chunker";
+import { embedBatch } from "@/lib/embeddings";
 
-RULES — NEVER BREAK THESE:
-1. You MUST only answer from retrieved document chunks. Never use your general knowledge for factual claims.
-2. Every factual claim MUST include a citation in the format [chunk_id].
-3. If retrieved chunks do not contain enough information to answer, respond EXACTLY:
-   "I cannot find sufficient information in the available documents to answer this question reliably."
-4. If documents contain contradictions on a topic, explicitly surface them:
-   "Note: The documents contain conflicting information — [doc A says X] vs [doc B says Y]."
-5. Never fabricate, hallucinate, or extrapolate beyond what the documents state.
+export async function POST(req: NextRequest) {
+  try {
+    const formData = await req.formData();
+    const file = formData.get("file") as File | null;
 
-PROCESS:
-- First retrieve relevant chunks using the search tool
-- Verify the chunks actually support the answer
-- Synthesise a grounded, cited response
-- Surface any contradictions or gaps honestly`;
+    if (!file) return NextResponse.json({ error: "No file provided" }, { status: 400 });
+    if (!file.name.endsWith(".pdf"))
+      return NextResponse.json({ error: "Only PDF files accepted" }, { status: 400 });
+    if (file.size > 10 * 1024 * 1024)
+      return NextResponse.json({ error: "File too large (max 10MB)" }, { status: 400 });
 
-export async function POST(req: Request) {
-  const { messages } = await req.json();
+    const buffer = Buffer.from(await file.arrayBuffer());
+    const pdfParse = (await import("pdf-parse")).default;
+    const parsed = await pdfParse(buffer);
+    const text = parsed.text;
 
-  return llmBreaker.call(async () => {
-    const result = streamText({
-      model: anthropic("claude-sonnet-4-6"),
-      system: SYSTEM_PROMPT,
-      messages,
-      maxSteps: 5,
-      tools: {
-        searchDocuments: tool({
-          description:
-            "Search the document corpus using hybrid semantic + keyword retrieval. Always call this before answering any factual question.",
-          parameters: z.object({
-            query: z.string().describe("The search query — be specific"),
-            topK: z.number().default(6).describe("Number of chunks to retrieve"),
-          }),
-          execute: async ({ query, topK }) => {
-            const chunks = await hybridSearch(query, topK);
-            if (chunks.length === 0) {
-              return {
-                found: false,
-                message: "No relevant chunks found for this query.",
-                chunks: [],
-              };
-            }
-            return {
-              found: true,
-              count: chunks.length,
-              context: formatChunksForPrompt(chunks),
-              chunkIds: chunks.map((c) => c.id.slice(0, 8)),
-            };
-          },
-        }),
+    if (!text || text.trim().length < 50)
+      return NextResponse.json({ error: "Could not extract text from PDF" }, { status: 422 });
 
-        verifyGrounding: tool({
-          description:
-            "Verify that your intended answer is actually grounded in the retrieved chunks. Call before giving a final answer.",
-          parameters: z.object({
-            intendedAnswer: z.string(),
-            chunkIds: z.array(z.string()),
-          }),
-          execute: async ({ intendedAnswer, chunkIds }) => {
-            const hasCitations = chunkIds.some((id) =>
-              intendedAnswer.includes(id)
-            );
-            return {
-              grounded: hasCitations || chunkIds.length > 0,
-              citationsPresent: hasCitations,
-              warning: !hasCitations
-                ? "Answer does not contain explicit chunk citations — add [chunk_id] references"
-                : null,
-            };
-          },
-        }),
-      },
+    const { data: doc, error: docErr } = await supabaseAdmin
+      .from("documents")
+      .insert({ name: file.name, source: "upload" })
+      .select()
+      .single();
+
+    if (docErr) throw docErr;
+
+    const chunks = chunkText(text, file.name);
+    const batchSize = 20;
+    let inserted = 0;
+
+    for (let i = 0; i < chunks.length; i += batchSize) {
+      const batch = chunks.slice(i, i + batchSize);
+      const embeddings = await embedBatch(batch.map((c) => c.content));
+
+      const rows = batch.map((chunk, j) => ({
+        doc_id: doc.id,
+        content: chunk.content,
+        metadata: { ...chunk.metadata, docName: file.name },
+        embedding: embeddings[j],
+      }));
+
+      const { error: insertErr } = await supabaseAdmin.from("chunks").insert(rows);
+      if (insertErr) throw insertErr;
+      inserted += batch.length;
+    }
+
+    return NextResponse.json({
+      success: true,
+      document: { id: doc.id, name: file.name },
+      chunks: inserted,
+      pages: parsed.numpages,
     });
-    return result.toDataStreamResponse();
-  });
+  } catch (err) {
+    console.error("Ingest error:", err);
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : "Ingestion failed" },
+      { status: 500 }
+    );
+  }
 }
