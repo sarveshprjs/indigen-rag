@@ -24,8 +24,8 @@ PROCESS:
 export async function POST(req: Request) {
   const { messages } = await req.json();
 
-  return llmBreaker.call(async () =>
-    streamText({
+  return llmBreaker.call(async () => {
+    const result = streamText({
       model: anthropic("claude-sonnet-4-6"),
       system: SYSTEM_PROMPT,
       messages,
@@ -64,7 +64,9 @@ export async function POST(req: Request) {
             chunkIds: z.array(z.string()),
           }),
           execute: async ({ intendedAnswer, chunkIds }) => {
-            const hasCitations = chunkIds.some((id) => intendedAnswer.includes(id));
+            const hasCitations = chunkIds.some((id) =>
+              intendedAnswer.includes(id)
+            );
             return {
               grounded: hasCitations || chunkIds.length > 0,
               citationsPresent: hasCitations,
@@ -75,7 +77,7 @@ export async function POST(req: Request) {
           },
         }),
       },
-    })
-      .then((r) => r.toDataStreamResponse())
-  );
+    });
+    return result.toDataStreamResponse();
+  });
 }
