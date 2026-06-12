@@ -17,7 +17,7 @@ create table if not exists chunks (
   doc_id uuid references documents(id) on delete cascade,
   content text not null,
   metadata jsonb default '{}',
-  embedding vector(1536),
+  embedding vector(384),
   fts tsvector generated always as (to_tsvector('english', content)) stored,
   created_at timestamptz default now()
 );
@@ -33,7 +33,7 @@ create index if not exists chunks_fts_idx on chunks using gin(fts);
 -- Hybrid search function (semantic + BM25 via RRF)
 create or replace function hybrid_search(
   query_text text,
-  query_embedding vector(1536),
+  query_embedding vector(384),
   match_count int default 8,
   rrf_k int default 60
 )

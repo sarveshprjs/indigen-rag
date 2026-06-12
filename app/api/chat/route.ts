@@ -1,69 +1,99 @@
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-import { NextRequest, NextResponse } from "next/server";
-import { supabaseAdmin } from "@/lib/supabase";
-import { chunkText } from "@/lib/chunker";
-import { embedBatch } from "@/lib/embeddings";
+import { streamText, tool } from "ai";
+import { createGroq } from "@ai-sdk/groq";
+import { z } from "zod";
+import { hybridSearch, formatChunksForPrompt } from "@/lib/retrieval";
 
-export async function POST(req: NextRequest) {
+// Groq — free tier, fast, OpenAI-compatible. Works fine from Vercel
+// serverless functions (no localhost dependency like Ollama).
+const groq = createGroq({ apiKey: process.env.GROQ_API_KEY });
+const model = groq("llama-3.3-70b-versatile");
+
+const SYSTEM_PROMPT = `You are an intelligent document analyst with access to a curated document corpus.
+
+RULES — NEVER BREAK THESE:
+1. You MUST only answer from retrieved document chunks. Never use your general knowledge for factual claims.
+2. Every factual claim MUST include a citation in the format [chunk_id].
+3. If retrieved chunks do not contain enough information to answer, respond EXACTLY:
+   "I cannot find sufficient information in the available documents to answer this question reliably."
+4. If documents contain contradictions on a topic, explicitly surface them:
+   "Note: The documents contain conflicting information — [doc A says X] vs [doc B says Y]."
+5. Never fabricate, hallucinate, or extrapolate beyond what the documents state.
+6. Always call searchDocuments at least once before answering.`;
+
+export async function POST(req: Request) {
   try {
-    const formData = await req.formData();
-    const file = formData.get("file") as File | null;
-
-    if (!file) return NextResponse.json({ error: "No file provided" }, { status: 400 });
-    if (!file.name.endsWith(".pdf"))
-      return NextResponse.json({ error: "Only PDF files accepted" }, { status: 400 });
-    if (file.size > 10 * 1024 * 1024)
-      return NextResponse.json({ error: "File too large (max 10MB)" }, { status: 400 });
-
-    const buffer = Buffer.from(await file.arrayBuffer());
-    const pdfParse = (await import("pdf-parse")).default;
-    const parsed = await pdfParse(buffer);
-    const text = parsed.text;
-
-    if (!text || text.trim().length < 50)
-      return NextResponse.json({ error: "Could not extract text from PDF" }, { status: 422 });
-
-    const { data: doc, error: docErr } = await supabaseAdmin
-      .from("documents")
-      .insert({ name: file.name, source: "upload" })
-      .select()
-      .single();
-
-    if (docErr) throw docErr;
-
-    const chunks = chunkText(text, file.name);
-    const batchSize = 20;
-    let inserted = 0;
-
-    for (let i = 0; i < chunks.length; i += batchSize) {
-      const batch = chunks.slice(i, i + batchSize);
-      const embeddings = await embedBatch(batch.map((c) => c.content));
-
-      const rows = batch.map((chunk, j) => ({
-        doc_id: doc.id,
-        content: chunk.content,
-        metadata: { ...chunk.metadata, docName: file.name },
-        embedding: embeddings[j],
-      }));
-
-      const { error: insertErr } = await supabaseAdmin.from("chunks").insert(rows);
-      if (insertErr) throw insertErr;
-      inserted += batch.length;
+    if (!process.env.GROQ_API_KEY) {
+      return new Response(
+        JSON.stringify({ error: "GROQ_API_KEY is not set. Get a free key at https://console.groq.com/keys" }),
+        { status: 500, headers: { "Content-Type": "application/json" } }
+      );
     }
 
-    return NextResponse.json({
-      success: true,
-      document: { id: doc.id, name: file.name },
-      chunks: inserted,
-      pages: parsed.numpages,
+    const { messages } = await req.json();
+
+    const { textStream } = streamText({
+      model,
+      system: SYSTEM_PROMPT,
+      messages,
+      maxSteps: 5,
+      tools: {
+        searchDocuments: tool({
+          description: "Search the document corpus using hybrid retrieval. Always call this before answering.",
+          parameters: z.object({
+            query: z.string().describe("The search query"),
+            topK: z.number().default(6),
+          }),
+          execute: async ({ query, topK }) => {
+            const chunks = await hybridSearch(query, topK);
+            if (chunks.length === 0) {
+              return { found: false, message: "No relevant chunks found.", chunks: [] };
+            }
+            return {
+              found: true,
+              count: chunks.length,
+              context: formatChunksForPrompt(chunks),
+              chunkIds: chunks.map((c) => c.id.slice(0, 8)),
+            };
+          },
+        }),
+      },
+    });
+
+    // Convert text stream to SSE format for useChat compatibility
+    const encoder = new TextEncoder();
+    const transformStream = new ReadableStream({
+      async start(controller) {
+        try {
+          for await (const chunk of textStream) {
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify({ type: "text-delta", text: chunk })}\n\n`)
+            );
+          }
+        } catch (err) {
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify({ type: "error", error: String(err) })}\n\n`)
+          );
+        }
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "message-stop" })}\n\n`));
+        controller.close();
+      },
+    });
+
+    return new Response(transformStream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
     });
   } catch (err) {
-    console.error("Ingest error:", err);
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Ingestion failed" },
-      { status: 500 }
-    );
+    console.error("Chat error:", err);
+    return new Response(JSON.stringify({ error: String(err) }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
   }
 }
