@@ -1,19 +1,25 @@
-import OpenAI from "openai";
+const HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2";
+const HF_TOKEN = process.env.HF_TOKEN ?? "";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+async function hfEmbed(texts: string[]): Promise<number[][]> {
+  const res = await fetch(HF_API_URL, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${HF_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ inputs: texts, options: { wait_for_model: true } }),
+  });
+  if (!res.ok) throw new Error(`HF embed error: ${res.status} ${await res.text()}`);
+  const data = await res.json();
+  return data as number[][];
+}
 
 export async function embed(text: string): Promise<number[]> {
-  const res = await openai.embeddings.create({
-    model: "text-embedding-3-small",
-    input: text.slice(0, 8000),
-  });
-  return res.data[0].embedding;
+  const result = await hfEmbed([text.slice(0, 512)]);
+  return result[0];
 }
 
 export async function embedBatch(texts: string[]): Promise<number[][]> {
-  const res = await openai.embeddings.create({
-    model: "text-embedding-3-small",
-    input: texts.map((t) => t.slice(0, 8000)),
-  });
-  return res.data.map((d) => d.embedding);
+  return hfEmbed(texts.map(t => t.slice(0, 512)));
 }
