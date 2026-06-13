@@ -1,26 +1,24 @@
 "use client";
-import { useChat } from "ai/react";
-import { useState, useRef, useEffect } from "react";
+import { useChat } from "@ai-sdk/react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 
-interface ToolCall {
-  toolName: string;
-  args: Record<string, unknown>;
-  result?: unknown;
-}
-
 export default function ChatPage() {
-  const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
-  const [traceOpen, setTraceOpen] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [traceOpen, setTraceOpen] = useState(true);
 
-  const { messages, input, handleInputChange, handleSubmit, isLoading, error } = useChat({
-    api: "/api/chat",
-    onFinish: () => setToolCalls([]),
-    onToolCall: ({ toolCall }) => {
-      setToolCalls((prev) => [...prev, { toolName: toolCall.toolName, args: toolCall.args as Record<string, unknown> }]);
-    },
-  });
+  const [input, setInput] = useState("");
+  const { messages, sendMessage, status } = useChat();
+  const isLoading = status === "submitted" || status === "streaming";
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() || isLoading) return;
+    sendMessage({ text: input });
+    setInput("");
+  };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => setInput(e.target.value);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -32,6 +30,13 @@ export default function ChatPage() {
     "What information is missing or unclear?",
     "Summarise the main findings with citations",
   ];
+
+  const handleSuggestedQuery = (query: string) => {
+    if (isLoading) return;
+    sendMessage({ text: query });
+  };
+
+  const agentStep = isLoading ? "Searching documents..." : null;
 
   return (
     <div style={{ display: "flex", height: "100vh", background: "var(--bg)", overflow: "hidden" }}>
@@ -74,7 +79,7 @@ export default function ChatPage() {
             <div style={{ fontSize: 11, color: "var(--text3)" }}>Grounded · Cited · Multi-agent</div>
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <span className="badge badge-purple">Claude claude-sonnet-4-6</span>
+            <span className="badge badge-purple">Claude 3.5 Sonnet</span>
             <span className="badge badge-teal">Hybrid RAG</span>
           </div>
         </div>
@@ -87,11 +92,15 @@ export default function ChatPage() {
                 <div style={{ fontSize: 40, marginBottom: 16 }}>🔍</div>
                 <div style={{ fontSize: 17, fontWeight: 700, color: "var(--text)", marginBottom: 8 }}>Ask anything about your documents</div>
                 <div style={{ fontSize: 13, color: "var(--text2)", marginBottom: 24, lineHeight: 1.6 }}>
-                  I use hybrid semantic + keyword retrieval, verify grounding, and cite every claim. I will refuse to answer if the documents don&apos;t contain the information.
+                  I use hybrid semantic + keyword retrieval, verify grounding, and cite every claim.
                 </div>
                 <div style={{ display: "grid", gap: 8 }}>
                   {suggestedQueries.map((q) => (
-                    <button key={q} onClick={() => { handleInputChange({ target: { value: q } } as React.ChangeEvent<HTMLInputElement>); }} style={{ background: "var(--bg3)", border: "1px solid var(--border2)", borderRadius: 8, padding: "10px 14px", color: "var(--text2)", fontSize: 12, cursor: "pointer", textAlign: "left", transition: "border-color 0.15s" }}>
+                    <button
+                      key={q}
+                      onClick={() => handleSuggestedQuery(q)}
+                      style={{ background: "var(--bg3)", border: "1px solid var(--border2)", borderRadius: 8, padding: "10px 14px", color: "var(--text2)", fontSize: 12, cursor: "pointer", textAlign: "left" }}
+                    >
                       {q}
                     </button>
                   ))}
@@ -99,55 +108,40 @@ export default function ChatPage() {
               </div>
             )}
 
-            {messages.map((m) => (
-              <div key={m.id} className="fade-in" style={{ display: "flex", gap: 10, alignItems: "flex-start", flexDirection: m.role === "user" ? "row-reverse" : "row" }}>
-                <div style={{ width: 30, height: 30, borderRadius: "50%", background: m.role === "user" ? "var(--accent)" : "var(--bg3)", border: "1px solid var(--border2)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, flexShrink: 0 }}>
-                  {m.role === "user" ? "U" : "🤖"}
-                </div>
-                <div style={{ maxWidth: "75%", background: m.role === "user" ? "rgba(124,111,255,0.12)" : "var(--bg2)", border: "1px solid " + (m.role === "user" ? "rgba(124,111,255,0.25)" : "var(--border)"), borderRadius: 12, padding: "10px 14px", fontSize: 13, lineHeight: 1.7, color: "var(--text)", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-                  {m.content}
-                  {m.toolInvocations && m.toolInvocations.length > 0 && (
-                    <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: 4 }}>
-                      {m.toolInvocations.map((t, i) => (
-                        <span key={i} className="badge badge-purple" style={{ fontSize: 10 }}>
-                          🔧 {t.toolName}
-                        </span>
-                      ))}
+            {messages
+              .filter((m) => m.role === "user" || m.role === "assistant")
+              .map((m) => {
+                // Get visible text content
+                const content = m.parts
+                  .filter((p) => p.type === "text")
+                  .map((p) => (p as { text: string }).text)
+                  .join("");
+
+                if (!content && m.role === "assistant") return null;
+
+                return (
+                  <div key={m.id} className="fade-in" style={{ display: "flex", gap: 10, alignItems: "flex-start", flexDirection: m.role === "user" ? "row-reverse" : "row" }}>
+                    <div style={{ width: 30, height: 30, borderRadius: "50%", background: m.role === "user" ? "var(--accent)" : "var(--bg3)", border: "1px solid var(--border2)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, flexShrink: 0 }}>
+                      {m.role === "user" ? "U" : "🤖"}
                     </div>
-                  )}
-                </div>
-              </div>
-            ))}
+                    <div style={{ maxWidth: "75%", background: m.role === "user" ? "rgba(124,111,255,0.12)" : "var(--bg2)", border: "1px solid " + (m.role === "user" ? "rgba(124,111,255,0.25)" : "var(--border)"), borderRadius: 12, padding: "10px 14px", fontSize: 13, lineHeight: 1.7, color: "var(--text)", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                      {content}
+                    </div>
+                  </div>
+                );
+              })}
 
             {isLoading && (
               <div className="fade-in" style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
                 <div style={{ width: 30, height: 30, borderRadius: "50%", background: "var(--bg3)", border: "1px solid var(--border2)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13 }}>🤖</div>
                 <div className="glass-sm" style={{ padding: "10px 14px" }}>
-                  {toolCalls.length > 0 ? (
-                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                      {toolCalls.map((tc, i) => (
-                        <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text2)" }}>
-                          <span className="spin" style={{ display: "inline-block" }}>⚙</span>
-                          <span style={{ color: "var(--accent)", fontWeight: 600 }}>{tc.toolName}</span>
-                          {tc.toolName === "searchDocuments" && <span>searching: &quot;{String(tc.args.query ?? "")}&quot;</span>}
-                          {tc.toolName === "verifyGrounding" && <span>verifying citations...</span>}
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                      <span className="typing-dot" />
-                      <span className="typing-dot" />
-                      <span className="typing-dot" />
-                    </div>
-                  )}
+                  <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                    <span className="typing-dot" />
+                    <span className="typing-dot" />
+                    <span className="typing-dot" />
+                    {agentStep && <span style={{ fontSize: 11, color: "var(--text2)", marginLeft: 6 }}>{agentStep}</span>}
+                  </div>
                 </div>
-              </div>
-            )}
-
-            {error && (
-              <div className="glass-sm" style={{ padding: "10px 14px", borderColor: "rgba(239,68,68,0.3)", color: "var(--red)", fontSize: 12 }}>
-                ⚠ {error.message}
               </div>
             )}
 
@@ -162,31 +156,13 @@ export default function ChatPage() {
                 <button onClick={() => setTraceOpen(false)} style={{ background: "none", border: "none", color: "var(--text3)", cursor: "pointer", fontSize: 16 }}>×</button>
               </div>
               <div style={{ flex: 1, overflowY: "auto", padding: "12px" }}>
-                {messages.filter((m) => m.toolInvocations && m.toolInvocations.length > 0).map((m) =>
-                  m.toolInvocations!.map((t, i) => (
-                    <div key={`${m.id}-${i}`} className="glass-sm fade-in" style={{ padding: 10, marginBottom: 8, fontSize: 11 }}>
-                      <div style={{ fontWeight: 600, color: "var(--accent)", marginBottom: 4 }}>🔧 {t.toolName}</div>
-                      {"args" in t && (
-                        <div style={{ color: "var(--text2)", marginBottom: 4 }}>
-                          {t.toolName === "searchDocuments" && <span>Query: &quot;{String((t.args as Record<string,unknown>).query ?? "")}&quot;</span>}
-                          {t.toolName === "verifyGrounding" && <span>Checking grounding...</span>}
-                        </div>
-                      )}
-                      {"result" in t && t.state === "result" && (
-                        <div style={{ color: "var(--green)", fontSize: 10 }}>
-                          ✓ {t.toolName === "searchDocuments" ? `Found ${(t.result as Record<string,unknown>)?.count ?? 0} chunks` : "Grounding verified"}
-                        </div>
-                      )}
-                    </div>
-                  ))
-                )}
-                {isLoading && toolCalls.length > 0 && (
+                {isLoading && agentStep && (
                   <div className="glass-sm" style={{ padding: 10, fontSize: 11, borderColor: "rgba(124,111,255,0.2)" }}>
                     <div className="pulse-dot" style={{ display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: "var(--accent)", marginRight: 6 }} />
-                    <span style={{ color: "var(--text2)" }}>Agent processing...</span>
+                    <span style={{ color: "var(--text2)" }}>{agentStep}</span>
                   </div>
                 )}
-                {messages.filter((m) => m.toolInvocations?.length).length === 0 && !isLoading && (
+                {!isLoading && (
                   <div style={{ color: "var(--text3)", fontSize: 11, textAlign: "center", paddingTop: 24 }}>
                     Agent steps will appear here during a query
                   </div>
@@ -211,7 +187,7 @@ export default function ChatPage() {
               disabled={isLoading}
               style={{ flex: 1, background: "var(--bg3)", border: "1px solid var(--border2)", borderRadius: 10, padding: "10px 14px", color: "var(--text)", fontSize: 13, outline: "none" }}
             />
-            <button type="submit" disabled={isLoading || !input.trim()} className="btn-primary" style={{ paddingLeft: 20, paddingRight: 20 }}>
+            <button type="submit" disabled={isLoading || !(input ?? "").trim()} className="btn-primary" style={{ paddingLeft: 20, paddingRight: 20 }}>
               {isLoading ? "..." : "Send"}
             </button>
           </form>

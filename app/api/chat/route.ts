@@ -1,7 +1,7 @@
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-import { streamText, tool } from "ai";
+import { streamText, tool, convertToModelMessages, stepCountIs, type UIMessage } from "ai";
 import { createGroq } from "@ai-sdk/groq";
 import { z } from "zod";
 import { hybridSearch, formatChunksForPrompt } from "@/lib/retrieval";
@@ -24,76 +24,45 @@ RULES — NEVER BREAK THESE:
 6. Always call searchDocuments at least once before answering.`;
 
 export async function POST(req: Request) {
-  try {
-    if (!process.env.GROQ_API_KEY) {
-      return new Response(
-        JSON.stringify({ error: "GROQ_API_KEY is not set. Get a free key at https://console.groq.com/keys" }),
-        { status: 500, headers: { "Content-Type": "application/json" } }
-      );
-    }
-
-    const { messages } = await req.json();
-
-    const { textStream } = streamText({
-      model,
-      system: SYSTEM_PROMPT,
-      messages,
-      maxSteps: 5,
-      tools: {
-        searchDocuments: tool({
-          description: "Search the document corpus using hybrid retrieval. Always call this before answering.",
-          parameters: z.object({
-            query: z.string().describe("The search query"),
-            topK: z.number().default(6),
-          }),
-          execute: async ({ query, topK }) => {
-            const chunks = await hybridSearch(query, topK);
-            if (chunks.length === 0) {
-              return { found: false, message: "No relevant chunks found.", chunks: [] };
-            }
-            return {
-              found: true,
-              count: chunks.length,
-              context: formatChunksForPrompt(chunks),
-              chunkIds: chunks.map((c) => c.id.slice(0, 8)),
-            };
-          },
-        }),
-      },
-    });
-
-    // Convert text stream to SSE format for useChat compatibility
-    const encoder = new TextEncoder();
-    const transformStream = new ReadableStream({
-      async start(controller) {
-        try {
-          for await (const chunk of textStream) {
-            controller.enqueue(
-              encoder.encode(`data: ${JSON.stringify({ type: "text-delta", text: chunk })}\n\n`)
-            );
-          }
-        } catch (err) {
-          controller.enqueue(
-            encoder.encode(`data: ${JSON.stringify({ type: "error", error: String(err) })}\n\n`)
-          );
-        }
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "message-stop" })}\n\n`));
-        controller.close();
-      },
-    });
-
-    return new Response(transformStream, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      },
-    });
-  } catch (err) {
-    console.error("Chat error:", err);
-    return new Response(JSON.stringify({ error: String(err) }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
+  if (!process.env.GROQ_API_KEY) {
+    return new Response(
+      JSON.stringify({ error: "GROQ_API_KEY is not set. Get a free key at https://console.groq.com/keys" }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
   }
+
+  const { messages }: { messages: UIMessage[] } = await req.json();
+
+  const result = streamText({
+    model,
+    system: SYSTEM_PROMPT,
+    messages: await convertToModelMessages(messages),
+    stopWhen: stepCountIs(5),
+    tools: {
+      searchDocuments: tool({
+        description: "Search the document corpus using hybrid retrieval. Always call this before answering.",
+        inputSchema: z.object({
+          query: z.string().describe("The search query"),
+          topK: z.number().default(6),
+        }),
+        execute: async ({ query, topK }) => {
+          const chunks = await hybridSearch(query, topK);
+          if (chunks.length === 0) {
+            return { found: false, message: "No relevant chunks found.", chunks: [] };
+          }
+          return {
+            found: true,
+            count: chunks.length,
+            context: formatChunksForPrompt(chunks),
+            chunkIds: chunks.map((c) => c.id.slice(0, 8)),
+          };
+        },
+      }),
+    },
+    onError: ({ error }) => {
+      console.error("streamText error:", error);
+    },
+  });
+
+  return result.toUIMessageStreamResponse();
 }
