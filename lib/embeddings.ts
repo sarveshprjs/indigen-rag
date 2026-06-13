@@ -1,14 +1,21 @@
 /**
- * Free embeddings via Hugging Face's free Inference API.
- * Model: sentence-transformers/all-MiniLM-L6-v2 (384 dims) — small, fast,
- * good enough for hybrid retrieval, and the HF free tier requires no billing.
+ * Free embeddings via Jina AI's embeddings API.
+ * Model: jina-embeddings-v3, truncated to 384 dims (Matryoshka representation
+ * learning — Jina embeddings support requesting a smaller `dimensions` value,
+ * which is just a truncation of the full vector, so this stays compatible
+ * with the existing vector(384) schema).
  *
- * Falls back to a deterministic local hash-embedding if HF is unavailable
- * (rate-limited / cold-starting model), so ingestion never hard-fails.
+ * Chosen over Hugging Face's Inference Providers API, which now requires a
+ * scope ("Make calls to Inference Providers") that isn't selectable on plain
+ * free accounts without billing setup. Jina's free API key
+ * (https://jina.ai/?sui=apikey) has no such friction.
+ *
+ * Falls back to a deterministic local hash-embedding if the API is
+ * unavailable, so ingestion never hard-fails.
  */
 
-const HF_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
-const HF_URL = `https://router.huggingface.co/hf-inference/models/${HF_MODEL}/pipeline/feature-extraction`;
+const JINA_URL = "https://api.jina.ai/v1/embeddings";
+const JINA_MODEL = "jina-embeddings-v3";
 export const EMBEDDING_DIM = 384;
 
 function localFallbackEmbedding(text: string): number[] {
@@ -22,69 +29,57 @@ function localFallbackEmbedding(text: string): number[] {
   return vec.map((v) => v / mag);
 }
 
-async function hfEmbed(text: string): Promise<number[]> {
-  const token = process.env.HF_TOKEN;
-  const res = await fetch(HF_URL, {
+async function jinaEmbed(texts: string[]): Promise<number[][]> {
+  const apiKey = process.env.JINA_API_KEY;
+  if (!apiKey) throw new Error("JINA_API_KEY is not set");
+
+  const res = await fetch(JINA_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      Authorization: `Bearer ${apiKey}`,
     },
-    // truncate to keep within the model's 256-token context
-    body: JSON.stringify({ inputs: text.slice(0, 2000), options: { wait_for_model: true } }),
+    body: JSON.stringify({
+      model: JINA_MODEL,
+      task: "retrieval.passage",
+      dimensions: EMBEDDING_DIM,
+      input: texts.map((t) => t.slice(0, 4000)),
+    }),
   });
 
   if (!res.ok) {
-    throw new Error(`HF embedding API error ${res.status}: ${await res.text()}`);
+    throw new Error(`Jina embedding API error ${res.status}: ${await res.text()}`);
   }
 
   const data = await res.json();
-
-  // feature-extraction returns either a flat vector (already pooled) or a
-  // [tokens][dims] matrix that needs mean-pooling.
-  let vec: number[];
-  if (Array.isArray(data[0])) {
-    if (Array.isArray(data[0][0])) {
-      // [1][tokens][dims]
-      vec = meanPool(data[0]);
-    } else {
-      // [tokens][dims]
-      vec = meanPool(data);
-    }
-  } else {
-    vec = data as number[];
-  }
-  return vec;
-}
-
-function meanPool(matrix: number[][]): number[] {
-  const dims = matrix[0].length;
-  const sums = new Array(dims).fill(0);
-  for (const row of matrix) {
-    for (let i = 0; i < dims; i++) sums[i] += row[i];
-  }
-  return sums.map((s) => s / matrix.length);
+  // data.data is sorted by `index`; sort defensively in case the API doesn't guarantee order
+  return (data.data as Array<{ index: number; embedding: number[] }>)
+    .sort((a, b) => a.index - b.index)
+    .map((d) => d.embedding);
 }
 
 export async function embed(text: string): Promise<number[]> {
   try {
-    return await withRetry(() => hfEmbed(text), 3);
+    const [vec] = await withRetry(() => jinaEmbed([text]), 3);
+    return vec;
   } catch (err) {
-    console.error("HF embedding failed, using local fallback:", err);
+    console.error("Jina embedding failed, using local fallback:", err);
     return localFallbackEmbedding(text);
   }
 }
 
-export async function embedBatch(texts: string[], concurrency = 4): Promise<number[][]> {
-  const results: number[][] = new Array(texts.length);
-  let idx = 0;
-  async function worker() {
-    while (idx < texts.length) {
-      const i = idx++;
-      results[i] = await embed(texts[i]);
+export async function embedBatch(texts: string[], batchSize = 16): Promise<number[][]> {
+  const results: number[][] = [];
+  for (let i = 0; i < texts.length; i += batchSize) {
+    const batch = texts.slice(i, i + batchSize);
+    try {
+      const vecs = await withRetry(() => jinaEmbed(batch), 3);
+      results.push(...vecs);
+    } catch (err) {
+      console.error("Jina embedding batch failed, using local fallback:", err);
+      results.push(...batch.map(localFallbackEmbedding));
     }
   }
-  await Promise.all(Array.from({ length: Math.min(concurrency, texts.length) }, worker));
   return results;
 }
 
