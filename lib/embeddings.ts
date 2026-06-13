@@ -8,7 +8,7 @@
  */
 
 const HF_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
-const HF_URL = `https://api-inference.huggingface.co/pipeline/feature-extraction/${HF_MODEL}`;
+const HF_URL = `https://router.huggingface.co/hf-inference/models/${HF_MODEL}/pipeline/feature-extraction`;
 export const EMBEDDING_DIM = 384;
 
 function localFallbackEmbedding(text: string): number[] {

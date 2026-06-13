@@ -80,8 +80,8 @@ begin
       coalesce(s.doc_id, k.doc_id) as doc_id,
       coalesce(s.content, k.content) as content,
       coalesce(s.metadata, k.metadata) as metadata,
-      coalesce(1.0 / (rrf_k + s.rank), 0) +
-      coalesce(1.0 / (rrf_k + k.rank), 0) as score
+      coalesce(1.0 / (rrf_k + s.rank), 0)::double precision +
+      coalesce(1.0 / (rrf_k + k.rank), 0)::double precision as score
     from semantic s
     full outer join keyword k on s.id = k.id
   )
